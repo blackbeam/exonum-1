@@ -37,18 +37,72 @@ use crate::blockchain::{Block, Schema, TransactionResult, TxLocation};
 use crate::crypto::Hash;
 use crate::events::error::into_failure;
 use crate::explorer::TxStatus;
-use crate::messages::{Message as ExonumMessage, ProtocolMessage, RawTransaction, SignedMessage};
+use crate::messages::{
+    to_hex_string, Message as ExonumMessage, ProtocolMessage, RawTransaction, Signed, SignedMessage,
+};
 
 use exonum_merkledb::{IndexAccess, ListProof, Snapshot};
+
+/// Websocket client request.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct Request {
+    /// Request identifier.
+    pub id: u64,
+    /// Request message.
+    pub message: RequestMessage,
+}
+
+impl Request {
+    /// Creates new message.
+    ///
+    /// Use this when response identification isn't needed.
+    pub fn new(message: RequestMessage) -> Self {
+        Request { id: 0, message }
+    }
+
+    /// Creates new message with specified id.
+    pub fn with_id(id: u64, message: RequestMessage) -> Self {
+        Request { id, message }
+    }
+}
+
+/// Response to a websocket client request.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[serde(tag = "type", content = "payload", rename_all = "kebab-case")]
+pub enum Response<T = serde_json::Value> {
+    /// Response to a request.
+    Response {
+        /// Response identifier.
+        id: u64,
+        /// Response payload.
+        payload: ResponsePayload<T>,
+    },
+    /// Response to a malformed request.
+    Malformed,
+}
 
 /// Message, coming from websocket connection.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(tag = "type", content = "payload", rename_all = "kebab-case")]
-enum IncomingMessage {
+pub enum RequestMessage {
     /// Set subscription for websocket connection.
     SetSubscriptions(Vec<SubscriptionType>),
     /// Send transaction to blockchain.
     Transaction(TransactionHex),
+}
+
+impl RequestMessage {
+    /// Creates transaction message.
+    pub fn tx<T>(tx: &Signed<T>) -> Self {
+        RequestMessage::Transaction(TransactionHex {
+            tx_body: to_hex_string(tx),
+        })
+    }
+
+    /// Creates set-subsciprions message.
+    pub fn subscriptions(types: Vec<SubscriptionType>) -> Self {
+        RequestMessage::SetSubscriptions(types)
+    }
 }
 
 /// Subscription type (new blocks or committed transactions).
@@ -395,39 +449,39 @@ impl Session {
         }
     }
 
-    fn process_incoming_message(&mut self, msg: IncomingMessage) -> WsStatus {
+    fn process_incoming_message(&mut self, msg: RequestMessage) -> ResponsePayload {
         match msg {
-            IncomingMessage::SetSubscriptions(subs) => self.set_subscriptions(subs),
-            IncomingMessage::Transaction(tx) => self.send_transaction(tx),
+            RequestMessage::SetSubscriptions(subs) => self.set_subscriptions(subs),
+            RequestMessage::Transaction(tx) => self.send_transaction(tx),
         }
     }
 
-    fn set_subscriptions(&mut self, subscriptions: Vec<SubscriptionType>) -> WsStatus {
+    fn set_subscriptions(&mut self, subscriptions: Vec<SubscriptionType>) -> ResponsePayload {
         self.subscriptions = subscriptions.clone();
         self.server_address
             .try_send(UpdateSubscriptions {
                 id: self.id,
                 subscriptions,
             })
-            .map(|_| WsStatus::Success { response: None })
-            .unwrap_or_else(|e| WsStatus::Error {
+            .map(|_| ResponsePayload::Success { response: None })
+            .unwrap_or_else(|e| ResponsePayload::Error {
                 description: e.to_string(),
             })
     }
 
-    fn send_transaction(&mut self, tx: TransactionHex) -> WsStatus {
+    fn send_transaction(&mut self, tx: TransactionHex) -> ResponsePayload {
         self.server_address
             .send(Transaction { tx })
             .wait()
             .map(|x| match x {
-                Ok(r) => WsStatus::Success {
+                Ok(r) => ResponsePayload::Success {
                     response: Some(serde_json::to_value(&r).unwrap()),
                 },
-                Err(e) => WsStatus::Error {
+                Err(e) => ResponsePayload::Error {
                     description: e.to_string(),
                 },
             })
-            .unwrap_or_else(|e| WsStatus::Error {
+            .unwrap_or_else(|e| ResponsePayload::Error {
                 description: e.to_string(),
             })
     }
@@ -480,14 +534,19 @@ impl Handler<Message> for Session {
     }
 }
 
+/// Web socket response payload
 #[serde(tag = "result", rename_all = "kebab-case")]
-#[derive(Debug, Serialize, Deserialize)]
-enum WsStatus {
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub enum ResponsePayload<T = serde_json::Value> {
+    /// Success response payload.
     Success {
+        /// Actual response, if any.
         #[serde(skip_serializing_if = "Option::is_none")]
-        response: Option<serde_json::Value>,
+        response: Option<T>,
     },
+    /// Error response payload.
     Error {
+        /// Error description.
         description: String,
     },
 }
@@ -498,11 +557,12 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Session {
             ws::Message::Ping(msg) => ctx.pong(&msg),
             ws::Message::Close(_) => ctx.stop(),
             ws::Message::Text(ref text) => {
-                let res = serde_json::from_str(text)
-                    .map(|m| self.process_incoming_message(m))
-                    .unwrap_or_else(|e| WsStatus::Error {
-                        description: e.to_string(),
-                    });
+                let res = serde_json::from_str::<Request>(text)
+                    .map(|m| Response::Response {
+                        id: m.id,
+                        payload: self.process_incoming_message(m.message),
+                    })
+                    .unwrap_or(Response::Malformed);
                 ctx.text(serde_json::to_string(&res).unwrap());
             }
             _ => {}
